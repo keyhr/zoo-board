@@ -2,8 +2,22 @@
 """Play a random animal sound on every keystroke.
 
 - Watches global key-press events via pynput.
-- On each press, picks random sound(s) from sounds/ and plays them with afplay.
+- On each press, picks random sound(s) from sounds/ and plays them.
 - Ignores key auto-repeat so that one physical keystroke maps to one trigger.
+
+Playback backends
+-----------------
+By default a low-latency, in-process backend is used (StreamPlayer): all
+sounds are decoded into memory once at startup and mixed into a single audio
+output stream that stays open for the whole session. A keystroke only appends
+samples to the mixer, so the sound starts on the next audio callback (a few
+milliseconds) instead of paying the cost of launching a process and
+initialising CoreAudio on every keystroke.
+
+If the audio libraries (sounddevice / numpy / soundfile) are unavailable, or
+with --legacy-afplay, playback falls back to spawning one `afplay` process per
+keystroke. That path is simpler but adds noticeable latency because each
+keystroke re-initialises the audio pipeline.
 
 On macOS, global key monitoring requires the "Input Monitoring" permission.
 The first run will ask you to grant it to the terminal app running this script
@@ -34,12 +48,126 @@ def load_sounds(directory):
     return files
 
 
-class SoundPlayer:
-    """Launch afplay non-blocking and cap the number of concurrent plays.
+class StreamPlayer:
+    """Low-latency player: one persistent output stream + software mixer.
 
-    The concurrency limit (max_concurrent) plus process reaping keep the
-    number of afplay processes bounded even under very fast typing.
-    This is the safeguard that keeps the tool from harming the machine.
+    All sounds are decoded to float32 stereo once at construction. Playing a
+    sound just appends a "voice" (a buffer plus a cursor) to a shared list;
+    the audio callback sums the active voices into each output block. Because
+    the stream and the audio device stay open for the whole session, a
+    keystroke turns into sound on the next callback (single-digit ms) with no
+    process spawn and no per-keystroke device initialisation.
+
+    The concurrency limit (max_concurrent) drops the oldest voice when the
+    cap is reached, keeping the mixing cost bounded under very fast typing.
+    """
+
+    def __init__(self, sounds, volume=1.0, max_concurrent=32, blocksize=0):
+        import numpy as np
+        import sounddevice as sd
+        import soundfile as sf
+
+        self.np = np
+        self.volume = volume
+        self.max_concurrent = max_concurrent
+        self.channels = 2
+
+        # Match the output device's native rate to avoid a resample in the
+        # hot path; sounds are resampled once, at load time, only if needed.
+        dev = sd.query_devices(kind="output")
+        self.samplerate = int(dev["default_samplerate"])
+
+        # Decode every sound into memory as contiguous float32 stereo.
+        self.buffers = {}
+        for path in sounds:
+            data, sr = sf.read(path, dtype="float32", always_2d=True)
+            if data.shape[1] == 1:
+                data = np.repeat(data, 2, axis=1)  # mono -> stereo
+            elif data.shape[1] > 2:
+                data = data[:, :2]
+            if sr != self.samplerate:
+                data = self._resample(data, sr, self.samplerate)
+            self.buffers[path] = np.ascontiguousarray(data, dtype=np.float32)
+
+        self._voices = []  # list of [buffer, position]
+        self._lock = threading.Lock()
+        self._stream = sd.OutputStream(
+            samplerate=self.samplerate,
+            channels=self.channels,
+            dtype="float32",
+            blocksize=blocksize,  # 0 -> let PortAudio pick a low-latency size
+            latency="low",
+            callback=self._callback,
+        )
+        self._stream.start()
+
+    def _resample(self, data, sr, target):
+        """Linear resample; only used when a file's rate != device rate."""
+        np = self.np
+        n = data.shape[0]
+        new_n = int(round(n * target / sr))
+        if new_n <= 1 or n <= 1:
+            return data
+        x_old = np.linspace(0.0, 1.0, n, endpoint=False)
+        x_new = np.linspace(0.0, 1.0, new_n, endpoint=False)
+        out = np.empty((new_n, data.shape[1]), dtype=np.float32)
+        for c in range(data.shape[1]):
+            out[:, c] = np.interp(x_new, x_old, data[:, c])
+        return out
+
+    def _callback(self, outdata, frames, time_info, status):
+        np = self.np
+        outdata.fill(0.0)
+        with self._lock:
+            still = []
+            for voice in self._voices:
+                buf, pos = voice
+                chunk = buf[pos:pos + frames]
+                n = chunk.shape[0]
+                if n:
+                    outdata[:n] += chunk
+                nxt = pos + frames
+                if nxt < buf.shape[0]:
+                    voice[1] = nxt
+                    still.append(voice)
+            self._voices = still
+        if self.volume != 1.0:
+            outdata *= self.volume
+        # Summed/amplified voices can exceed [-1, 1]; clip to avoid overflow.
+        np.clip(outdata, -1.0, 1.0, out=outdata)
+
+    def play_many(self, paths):
+        """Play several sounds at once (for chaos)."""
+        with self._lock:
+            for path in paths:
+                buf = self.buffers.get(path)
+                if buf is None:
+                    continue
+                # If over the concurrency cap, drop the oldest voice.
+                while len(self._voices) >= self.max_concurrent:
+                    self._voices.pop(0)
+                self._voices.append([buf, 0])
+
+    def stop_all(self):
+        with self._lock:
+            self._voices = []
+
+    def close(self):
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:
+            pass
+
+
+class SoundPlayer:
+    """Fallback player: launch afplay non-blocking, cap concurrent plays.
+
+    One `afplay` process is spawned per keystroke. The concurrency limit
+    (max_concurrent) plus process reaping keep the number of afplay processes
+    bounded even under very fast typing. This path is simpler than
+    StreamPlayer but adds latency, since each keystroke re-initialises the
+    audio pipeline from scratch.
     """
 
     def __init__(self, volume=1.0, max_concurrent=32):
@@ -81,6 +209,32 @@ class SoundPlayer:
             for p in self._procs:
                 p.terminate()
             self._procs.clear()
+
+    def close(self):
+        self.stop_all()
+
+
+def create_player(sounds, volume, max_concurrent, force_afplay=False):
+    """Build the best available player.
+
+    Returns (player, backend_name). Prefers the low-latency StreamPlayer and
+    falls back to the afplay SoundPlayer if the audio libraries are missing or
+    the output stream cannot be opened.
+    """
+    if not force_afplay:
+        try:
+            player = StreamPlayer(
+                sounds, volume=volume, max_concurrent=max_concurrent
+            )
+            return player, "stream"
+        except Exception as e:
+            print(
+                f"Low-latency backend unavailable ({e}); using afplay.\n"
+                f"  For the low-latency backend: "
+                f"./.venv/bin/python -m pip install sounddevice numpy soundfile",
+                file=sys.stderr,
+            )
+    return SoundPlayer(volume=volume, max_concurrent=max_concurrent), "afplay"
 
 
 class ChaosKeyboard:
@@ -136,7 +290,7 @@ def main():
     )
     parser.add_argument(
         "-v", "--volume", type=float, default=1.0,
-        help="Volume (afplay -v; values above 1.0 amplify. Default 1.0).",
+        help="Volume (values above 1.0 amplify. Default 1.0).",
     )
     parser.add_argument(
         "-m", "--max-concurrent", type=int, default=32,
@@ -149,6 +303,11 @@ def main():
     parser.add_argument(
         "--allow-repeat", action="store_true",
         help="Also fire on key auto-repeat (held key). Even more chaos.",
+    )
+    parser.add_argument(
+        "--legacy-afplay", action="store_true",
+        help="Force the afplay backend (one process per keystroke; higher "
+             "latency). Default is the low-latency in-process mixer.",
     )
     args = parser.parse_args()
     if args.sounds_per_key < 1:
@@ -164,10 +323,13 @@ def main():
         from pynput import keyboard
     except ImportError:
         print("Error: pynput is not installed.", file=sys.stderr)
-        print("  ./.venv/bin/pip install pynput", file=sys.stderr)
+        print("  ./.venv/bin/python -m pip install pynput", file=sys.stderr)
         return 1
 
-    player = SoundPlayer(volume=args.volume, max_concurrent=args.max_concurrent)
+    player, backend = create_player(
+        sounds, args.volume, args.max_concurrent,
+        force_afplay=args.legacy_afplay,
+    )
     chaos = ChaosKeyboard(
         player, sounds,
         sounds_per_key=args.sounds_per_key,
@@ -176,6 +338,11 @@ def main():
 
     names = ", ".join(os.path.splitext(os.path.basename(s))[0] for s in sounds)
     print(f"Animal sounds: {len(sounds)} kinds ({names})")
+    backend_desc = (
+        "in-process mixer (low latency)" if backend == "stream"
+        else "afplay (one process per keystroke)"
+    )
+    print(f"Backend: {backend_desc}")
     print(f"Chaos: up to {args.sounds_per_key} sounds per keystroke / "
           f"volume {args.volume} / concurrency cap {args.max_concurrent}")
     print("Type on the keyboard to make noise. Quit with Ctrl+C.")
@@ -191,7 +358,7 @@ def main():
         pass
     finally:
         listener.stop()
-        player.stop_all()
+        player.close()
         print("\nStopped.")
     return 0
 

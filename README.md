@@ -4,6 +4,10 @@ Turn your keyboard into a zoo.
 A macOS tool that plays a random animal sound on every keystroke.
 Built for chaos, it layers multiple sounds per keystroke by default. 21 animals included.
 
+Sounds are decoded into memory once and mixed through a single, always-open
+audio stream, so a keystroke turns into sound within a few milliseconds instead
+of launching a new player process each time.
+
 ## Requirements
 
 - macOS (uses `afplay`)
@@ -38,8 +42,22 @@ The playback sounds in `sounds/` are bundled with the repository, so no fetching
 | `-v, --volume V` | 1.0 | Volume (`afplay -v`; values above 1.0 amplify) |
 | `-m, --max-concurrent N` | 32 | Cap on concurrent plays (runaway safeguard) |
 | `--allow-repeat` | off | Also play on key-hold auto-repeat |
+| `--legacy-afplay` | off | Force the old `afplay` backend (one process per keystroke; higher latency) |
 
 Example (maximum chaos): `./run.sh -n 6 -v 1.5 --allow-repeat`
+
+## Playback backend
+
+By default playback uses a low-latency, in-process mixer built on
+`sounddevice`, `numpy`, and `soundfile` (installed via `requirements.txt`).
+All sounds are decoded once at startup, and the audio output stream stays open
+for the whole session; a keystroke only appends samples to the mixer.
+
+If those libraries are unavailable, or when `--legacy-afplay` is passed, the
+tool falls back to spawning one `afplay` process per keystroke. That path needs
+no extra Python packages but adds noticeable latency, because each keystroke
+re-initialises the audio pipeline from scratch. `ffmpeg` is not required at
+runtime by either backend.
 
 ## macOS permission (required)
 

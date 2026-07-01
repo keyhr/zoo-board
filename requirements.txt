@@ -1,1 +1,7 @@
 pynput
+
+# Low-latency in-process audio backend (StreamPlayer).
+# If these are absent, playback falls back to spawning `afplay` per keystroke.
+sounddevice
+numpy
+soundfile
